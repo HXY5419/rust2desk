@@ -1,14 +1,14 @@
 name: Build the flutter version of the RustDesk
 
-于:
+on:
   workflow_call:
     inputs:
       upload-artifact:
-        输入: boolean
-        默认: true
+        type: boolean
+        default: true
       upload-tag:
-        输入: string
-        默认: "nightly"
+        type: string
+        default: "nightly"
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
@@ -429,7 +429,7 @@ jobs:
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
-          文件: |
+          files: |
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
@@ -767,7 +767,7 @@ jobs:
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
-          文件: |
+          files: |
             rustdesk*-${{ matrix.job.arch }}.dmg
 
   publish_unsigned:
@@ -811,4 +811,4 @@ jobs:
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
-          文件: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
+          files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
